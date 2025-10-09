@@ -277,6 +277,64 @@ function App() {
     };
   }, [user]);
 
+  // Realtime: мои списки как владелец (shopping_lists)
+  useEffect(() => {
+    if (!currentUserId) return;
+    const ch = supabase
+      .channel('rt-shopping-lists-owner')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'shopping_lists',
+        filter: `owner_id=eq.${currentUserId}`,
+      }, async (payload) => {
+        const { eventType, new: rowNew, old: rowOld } = payload;
+        setStores(prev => {
+          if (eventType === 'INSERT') {
+            if (prev.some(s => s.id === rowNew.id)) return prev;
+            return [{ id: rowNew.id, name: rowNew.name, created_at: rowNew.created_at, owner_id: rowNew.owner_id }, ...prev];
+          }
+          if (eventType === 'UPDATE') {
+            return prev.map(s => s.id === rowNew.id ? { ...s, ...rowNew } : s);
+          }
+          if (eventType === 'DELETE') {
+            return prev.filter(s => s.id !== rowOld.id);
+          }
+          return prev;
+        });
+      })
+      .subscribe();
+    return () => ch.unsubscribe();
+  }, [currentUserId]);
+
+  // Realtime: меня добавили/удалили из списка (list_members)
+  useEffect(() => {
+    if (!currentUserId) return;
+    const ch = supabase
+      .channel('rt-list-members-self')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'list_members',
+        filter: `user_id=eq.${currentUserId}`,
+      }, async (payload) => {
+        const { eventType, new: rowNew, old: rowOld } = payload;
+        if (eventType === 'INSERT') {
+          const { data: s } = await supabase
+            .from('shopping_lists')
+            .select('id, name, created_at, owner_id')
+            .eq('id', rowNew.list_id)
+            .single();
+          if (s) setStores(prev => (prev.some(x => x.id === s.id) ? prev : [s, ...prev]));
+        }
+        if (eventType === 'DELETE') {
+          setStores(prev => prev.filter(s => s.id !== rowOld.list_id));
+        }
+      })
+      .subscribe();
+    return () => ch.unsubscribe();
+  }, [currentUserId]);
+
   useEffect(() => {
     if (!currentStore) return;
 
