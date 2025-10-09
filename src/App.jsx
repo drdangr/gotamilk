@@ -380,6 +380,33 @@ function App() {
     return () => ch.unsubscribe();
   }, [stores]);
 
+  // Realtime: обновление никнеймов в profiles (чтобы чипы/авторы менялись мгновенно)
+  useEffect(() => {
+    const ch = supabase
+      .channel('rt-profiles')
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'profiles',
+      }, (payload) => {
+        const uid = payload.new?.user_id;
+        const nick = payload.new?.nickname ?? '';
+        if (!uid) return;
+        // Обновить ник в чипах участников
+        setListMembersMap(prev => {
+          const copy = { ...prev };
+          Object.keys(copy).forEach(listId => {
+            copy[listId] = (copy[listId] || []).map(m => m.user_id === uid ? { ...m, nickname: nick } : m);
+          });
+          return copy;
+        });
+        // Обновить ник в авторах намерений
+        setProfilesMap(prev => ({ ...prev, [uid]: nick }));
+      })
+      .subscribe();
+    return () => ch.unsubscribe();
+  }, []);
+
   useEffect(() => {
     if (!currentStore) return;
 
@@ -1261,18 +1288,21 @@ function App() {
                 {/* Чипы участников */}
                 <div className="mt-2 flex flex-wrap gap-2">
                   {(listMembersMap[list.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
-                    <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
-                      {m.nickname || 'Участник'}
-                      {m.user_id !== list.owner_id && (
-                        <button
-                          onClick={() => handleRemoveMember(list.id, m.user_id)}
-                          className="ml-1 text-red-600 hover:text-red-800"
-                          title="Удалить из списка"
-                        >
-                          ×
-                        </button>
-                      )}
-                    </span>
+                    m.user_id !== list.owner_id ? (
+                      <button
+                        key={m.user_id}
+                        onClick={() => handleRemoveMember(list.id, m.user_id)}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-50 text-red-700 text-xs border border-red-200 active:bg-red-100"
+                        title="Удалить участника"
+                      >
+                        {m.nickname || 'Участник'}
+                        <span className="ml-1">×</span>
+                      </button>
+                    ) : (
+                      <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
+                        {m.nickname || 'Участник'}
+                      </span>
+                    )
                   ))}
                 </div>
               </div>
@@ -1306,18 +1336,21 @@ function App() {
                     </button>
                     <div className="mt-2 flex flex-wrap gap-2">
                       {(listMembersMap[list.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
-                        <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
-                          {m.nickname || 'Участник'}
-                          {m.user_id !== list.owner_id && (
-                            <button
-                              onClick={() => handleRemoveMember(list.id, m.user_id)}
-                              className="ml-1 text-red-600 hover:text-red-800"
-                              title="Удалить из списка"
-                            >
-                              ×
-                            </button>
-                          )}
-                        </span>
+                        m.user_id !== list.owner_id ? (
+                          <button
+                            key={m.user_id}
+                            onClick={() => handleRemoveMember(list.id, m.user_id)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-50 text-red-700 text-xs border border-red-200 active:bg-red-100"
+                            title="Удалить участника"
+                          >
+                            {m.nickname || 'Участник'}
+                            <span className="ml-1">×</span>
+                          </button>
+                        ) : (
+                          <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
+                            {m.nickname || 'Участник'}
+                          </span>
+                        )
                       ))}
                     </div>
                   </div>
