@@ -335,6 +335,51 @@ function App() {
     return () => ch.unsubscribe();
   }, [currentUserId]);
 
+  // Realtime: изменения состава участников для видимых списков (чипы на экране "Мои списки")
+  useEffect(() => {
+    if (!stores || stores.length === 0) return;
+    const visibleIds = new Set(stores.map(s => s.id));
+    const ch = supabase
+      .channel('rt-list-members-visible')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'list_members',
+      }, async (payload) => {
+        const { eventType, new: rowNew, old: rowOld } = payload;
+        if (eventType === 'INSERT') {
+          if (!visibleIds.has(rowNew.list_id)) return;
+          // получить ник, если его нет
+          let nickname = '';
+          try {
+            const { data: p } = await supabase
+              .from('profiles')
+              .select('nickname')
+              .eq('user_id', rowNew.user_id)
+              .single();
+            nickname = p?.nickname || 'Участник';
+          } catch (_) { nickname = 'Участник'; }
+          setListMembersMap(prev => {
+            const copy = { ...prev };
+            const arr = copy[rowNew.list_id] ? [...copy[rowNew.list_id]] : [];
+            if (!arr.some(m => m.user_id === rowNew.user_id)) arr.push({ user_id: rowNew.user_id, nickname });
+            copy[rowNew.list_id] = arr;
+            return copy;
+          });
+        }
+        if (eventType === 'DELETE') {
+          if (!visibleIds.has(rowOld.list_id)) return;
+          setListMembersMap(prev => {
+            const copy = { ...prev };
+            copy[rowOld.list_id] = (copy[rowOld.list_id] || []).filter(m => m.user_id !== rowOld.user_id);
+            return copy;
+          });
+        }
+      })
+      .subscribe();
+    return () => ch.unsubscribe();
+  }, [stores]);
+
   useEffect(() => {
     if (!currentStore) return;
 
