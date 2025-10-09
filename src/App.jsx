@@ -6,6 +6,7 @@ import { fetchBestPricesForItemNames, upsertItemPriceByCatalogId, fetchPricesFor
 import { fetchCatalog, addCatalogItem, renameCatalogItem, deleteCatalogItem, upsertCatalogNames, fetchAliases, addAlias, deleteAlias, updateCatalogUnit, updateCatalogDisplayName, searchCatalogSuggestions, mapDisplayNamesForItems } from './services/catalog';
 import { useListItems } from './hooks/useListItems';
 import { enqueueOp, countPending, syncOnce } from './offline/queue';
+import { generateJoinCode, fetchMembersForLists, removeMember } from './services/lists';
 
 // Supabase клиент вынесен в ./lib/supabaseClient
 
@@ -104,6 +105,8 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
   const [joinCode, setJoinCode] = useState('');
+  const [showShare, setShowShare] = useState(false);
+  const [inviteCode, setInviteCode] = useState('');
   const [showAuthors, setShowAuthors] = useState(true);
   const [showNotifications, setShowNotifications] = useState(true);
   const [email, setEmail] = useState('');
@@ -124,6 +127,7 @@ function App() {
   const [toasts, setToasts] = useState([]);
   const [pendingOps, setPendingOps] = useState(0);
   const [presenceMap, setPresenceMap] = useState({});
+  const [listMembersMap, setListMembersMap] = useState({}); // {listId: [{user_id, nickname}]}
 
   const addToast = (message) => {
     if (!showNotifications) return;
@@ -171,6 +175,24 @@ function App() {
       loadShops();  // справочник магазинов
     }
   }, [user]);
+
+  // Подтягиваем участников для всех видимых списков
+  useEffect(() => {
+    const fetchMembers = async () => {
+      try {
+        if (!stores || stores.length === 0) {
+          setListMembersMap({});
+          return;
+        }
+        const ids = stores.map(s => s.id);
+        const map = await fetchMembersForLists(ids);
+        setListMembersMap(map);
+      } catch (e) {
+        // мягко игнорируем
+      }
+    };
+    fetchMembers();
+  }, [stores]);
 
   // Загрузка каталога при переходе на экран
   useEffect(() => {
@@ -370,7 +392,7 @@ function App() {
     // list-first: показываем списки пользователя
     const { data, error } = await supabase
       .from('shopping_lists')
-      .select('id, name, created_at')
+      .select('id, name, created_at, owner_id')
       .order('created_at', { ascending: false });
     if (!error && data) setStores(data);
   };
@@ -837,9 +859,56 @@ function App() {
       if (error) throw error;
       setShowJoin(false);
       setJoinCode('');
-      alert('Вы присоединились к списку!');
+      addToast('Готово: вы присоединились к списку');
+      try { await loadStores(); } catch {}
     } catch (e) {
       alert(e.message || 'Не удалось присоединиться. Проверьте код.');
+    }
+  };
+
+  const openShare = async () => {
+    setShowShare(true);
+    setInviteCode('');
+  };
+
+  const handleGenerateInvite = async () => {
+    if (!currentList?.id) return;
+    try {
+      const res = await generateJoinCode(currentList.id);
+      const code = typeof res === 'string' ? res : (res?.code || '');
+      setInviteCode(code);
+      if (!code) addToast('Не удалось получить код. Попробуйте позже');
+    } catch (e) {
+      alert(e.message || 'Не удалось сгенерировать код');
+    }
+  };
+
+  const copyInvite = async () => {
+    if (!inviteCode) return;
+    try {
+      await navigator.clipboard.writeText(inviteCode);
+      addToast('Код скопирован');
+    } catch {
+      window.prompt('Скопируйте код приглашения:', inviteCode);
+    }
+  };
+
+  const handleRemoveMember = async (listId, userId) => {
+    if (!window.confirm('Удалить участника из списка?')) return;
+    try {
+      await removeMember(listId, userId);
+      setListMembersMap(prev => {
+        const copy = { ...prev };
+        copy[listId] = (copy[listId] || []).filter(m => m.user_id !== userId);
+        return copy;
+      });
+      // Если удалили сами себя — обновим список доступных списков
+      if (userId === currentUserId) {
+        await loadStores();
+      }
+      addToast('Участник удален');
+    } catch (e) {
+      alert(e.message || 'Не удалось удалить участника');
     }
   };
 
@@ -957,6 +1026,8 @@ function App() {
 
   // Экран списков (list-first)
   if (currentView === 'stores') {
+    const myLists = stores.filter(l => l.owner_id === currentUserId);
+    const sharedLists = stores.filter(l => l.owner_id && l.owner_id !== currentUserId);
     return (
       <div className="min-h-screen bg-gray-50 p-4">
         <div className="max-w-md mx-auto">
@@ -992,20 +1063,74 @@ function App() {
             </div>
           </div>
 
+          {myLists.length > 0 && (
+            <div className="mb-2 text-sm text-gray-500">Мои списки</div>
+          )}
           <div className="space-y-3">
-            {stores.map(list => (
-              <button
-                key={list.id}
-                onClick={() => {
-                  setCurrentList(list);
-                  setCurrentView('shopping');
-                }}
-                className="w-full p-4 bg-white rounded-lg shadow hover:shadow-md transition-shadow text-left"
-              >
-                <div className="font-semibold text-lg">{list.name}</div>
-              </button>
+            {myLists.map(list => (
+              <div key={list.id} className="p-4 bg-white rounded-lg shadow">
+                <button
+                  onClick={() => {
+                    setCurrentList(list);
+                    setCurrentView('shopping');
+                  }}
+                  className="w-full text-left"
+                >
+                  <div className="font-semibold text-lg">{list.name}</div>
+                </button>
+                {/* Чипы участников */}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {(listMembersMap[list.id] || []).map(m => (
+                    <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
+                      {m.nickname || 'Участник'}
+                      <button
+                        onClick={() => handleRemoveMember(list.id, m.user_id)}
+                        className="ml-1 text-red-600 hover:text-red-800"
+                        title="Удалить из списка"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
             ))}
           </div>
+
+          {sharedLists.length > 0 && (
+            <>
+              <div className="mt-6 mb-2 text-sm text-gray-500">Со мной поделились</div>
+              <div className="space-y-3">
+                {sharedLists.map(list => (
+                  <div key={list.id} className="p-4 bg-white rounded-lg shadow">
+                    <button
+                      onClick={() => {
+                        setCurrentList(list);
+                        setCurrentView('shopping');
+                      }}
+                      className="w-full text-left"
+                    >
+                      <div className="font-semibold text-lg">{list.name}</div>
+                    </button>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {(listMembersMap[list.id] || []).map(m => (
+                        <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
+                          {m.nickname || 'Участник'}
+                          <button
+                            onClick={() => handleRemoveMember(list.id, m.user_id)}
+                            className="ml-1 text-red-600 hover:text-red-800"
+                            title="Удалить из списка"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
 
           <button
             onClick={addStore}
@@ -1105,6 +1230,35 @@ function App() {
               >
                 Присоединиться
               </button>
+            </div>
+          </div>
+        )}
+
+        {showShare && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end sm:items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full max-w-md p-6">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold">Поделиться списком</h2>
+                <button onClick={() => setShowShare(false)} className="p-1">
+                  <X size={24} />
+                </button>
+              </div>
+              {inviteCode ? (
+                <>
+                  <div className="p-3 border rounded-lg bg-gray-50 font-mono text-center select-all">
+                    {inviteCode}
+                  </div>
+                  <div className="flex gap-2 mt-4">
+                    <button onClick={copyInvite} className="flex-1 p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600">Скопировать код</button>
+                    <button onClick={handleGenerateInvite} className="p-3 bg-gray-100 text-gray-800 rounded-lg hover:bg-gray-200">Обновить</button>
+                  </div>
+                </>
+              ) : (
+                <button onClick={handleGenerateInvite} className="w-full p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600">
+                  Сгенерировать код
+                </button>
+              )}
+              <p className="text-xs text-gray-500 mt-3">Передайте код другу — он введет его в разделе «Присоединиться по коду».</p>
             </div>
           </div>
         )}
@@ -1369,9 +1523,44 @@ function App() {
                   Синхронизация ({pendingOps})
                 </button>
               )}
-              <div className="w-4" />
+              <button
+                onClick={openShare}
+                className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded border border-blue-200"
+              >
+                Поделиться
+              </button>
+              <div className="w-2" />
             </div>
           </div>
+
+          {showShare && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end sm:items-center justify-center p-4 z-50">
+              <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full max-w-md p-6">
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-xl font-bold">Поделиться списком</h2>
+                  <button onClick={() => setShowShare(false)} className="p-1">
+                    <X size={24} />
+                  </button>
+                </div>
+                {inviteCode ? (
+                  <>
+                    <div className="p-3 border rounded-lg bg-gray-50 font-mono text-center select-all">
+                      {inviteCode}
+                    </div>
+                    <div className="flex gap-2 mt-4">
+                      <button onClick={copyInvite} className="flex-1 p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600">Скопировать код</button>
+                      <button onClick={handleGenerateInvite} className="p-3 bg-gray-100 text-gray-800 rounded-lg hover:bg-gray-200">Обновить</button>
+                    </div>
+                  </>
+                ) : (
+                  <button onClick={handleGenerateInvite} className="w-full p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600">
+                    Сгенерировать код
+                  </button>
+                )}
+                <p className="text-xs text-gray-500 mt-3">Передайте код другу — он введет его в разделе «Присоединиться по коду».</p>
+              </div>
+            </div>
+          )}
 
           <div className="flex gap-2">
             <input
