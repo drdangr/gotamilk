@@ -433,12 +433,13 @@ function App() {
     const itemsChannel = supabase
       .channel('items-changes')
       .on('postgres_changes', { 
-        event: '*', 
-        schema: 'public', 
-        table: 'list_items',
-        filter: `list_id=eq.${currentList.id}`
+        event: '*',
+        schema: 'public',
+        table: 'list_items'
       }, (payload) => {
         const { eventType, new: newRow, old } = payload;
+        const affectedListId = (newRow?.list_id ?? old?.list_id);
+        if (!affectedListId || affectedListId !== currentList.id) return;
         setItems(prev => {
           if (eventType === 'INSERT') {
             if (prev.some(i => i.id === newRow.id)) return prev;
@@ -844,7 +845,7 @@ function App() {
     setItems(prev => prev.map(i => i.id === itemId ? { ...i, department: newDept } : i));
     try {
       await supabase
-        .from('items')
+        .from('list_items')
         .update({ department: newDept })
         .eq('id', itemId);
       const normalized = itemName.toLowerCase().trim();
@@ -883,7 +884,7 @@ function App() {
 
   const uncheckAll = async () => {
     await supabase
-      .from('items')
+      .from('list_items')
       .update({ checked: false })
       .eq('list_id', currentList.id);
   };
