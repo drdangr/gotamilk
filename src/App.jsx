@@ -1,11 +1,13 @@
-import React, { useState, useEffect } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import React, { useState, useEffect, useRef } from 'react';
+import { supabase } from './lib/supabaseClient';
 import { Plus, Settings, ChevronDown, ChevronUp, Check, X, Trash2, RotateCcw, ArrowLeft, Move, LogOut } from 'lucide-react';
+import { upsertIntention, clearIntention } from './services/intentions';
+import { fetchBestPricesForItemNames, upsertItemPriceByCatalogId, fetchPricesForCatalogItem, deletePriceByCatalogId } from './services/prices';
+import { fetchCatalog, addCatalogItem, renameCatalogItem, deleteCatalogItem, upsertCatalogNames, fetchAliases, addAlias, deleteAlias, updateCatalogUnit, updateCatalogDisplayName, searchCatalogSuggestions, mapDisplayNamesForItems } from './services/catalog';
+import { useListItems } from './hooks/useListItems';
+import { enqueueOp, countPending, syncOnce } from './offline/queue';
 
-// Инициализация Supabase
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Supabase клиент вынесен в ./lib/supabaseClient
 
 // Fallback категории
 const FALLBACK_CATEGORIES = {
@@ -25,6 +27,12 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [currentView, setCurrentView] = useState('stores');
   const [stores, setStores] = useState([]);
+  const [shops, setShops] = useState([]);
+  const [catalog, setCatalog] = useState([]);
+  const [catalogSearch, setCatalogSearch] = useState('');
+  const [catalogPrices, setCatalogPrices] = useState({}); // {catalogItemId: {storeId: {price, quantity}}}
+  const [catalogAliases, setCatalogAliases] = useState({}); // {catalogItemId: [{id, full_name}]}
+  // list-first: магазин как сущность не главный экран
   const [currentStore, setCurrentStore] = useState(null);
   const [currentList, setCurrentList] = useState(null);
   const [lists, setLists] = useState([]);
@@ -32,9 +40,16 @@ function App() {
   const [sortingRules, setSortingRules] = useState({});
   const [newItemName, setNewItemName] = useState('');
   const [newItemQuantity, setNewItemQuantity] = useState('');
+  const [typeaheadOpen, setTypeaheadOpen] = useState(false);
+  const [typeaheadItems, setTypeaheadItems] = useState([]);
+  const typeaheadTimer = useRef(null);
   const [claudeApiKey, setClaudeApiKey] = useState('');
   const [expandedDepts, setExpandedDepts] = useState({});
   const [showSettings, setShowSettings] = useState(false);
+  const [showJoin, setShowJoin] = useState(false);
+  const [joinCode, setJoinCode] = useState('');
+  const [showAuthors, setShowAuthors] = useState(true);
+  const [showNotifications, setShowNotifications] = useState(true);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSignUp, setIsSignUp] = useState(false);
@@ -42,16 +57,46 @@ function App() {
   const [showDepartmentPicker, setShowDepartmentPicker] = useState(false);
   const [showNewDepartment, setShowNewDepartment] = useState(false);
   const [newDepartmentName, setNewDepartmentName] = useState('');
+  const [intentions, setIntentions] = useState([]);
+  const [intentionsMap, setIntentionsMap] = useState({});
+  const [profilesMap, setProfilesMap] = useState({});
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [bestPrices, setBestPrices] = useState({});
+  const [myStoreId, setMyStoreId] = useState('');
+  const [filterMyStore, setFilterMyStore] = useState(false);
+  const [nickname, setNickname] = useState('');
+  const [toasts, setToasts] = useState([]);
+  const [pendingOps, setPendingOps] = useState(0);
+  const [presenceMap, setPresenceMap] = useState({});
+
+  const addToast = (message) => {
+    if (!showNotifications) return;
+    const id = Math.random().toString(36).slice(2);
+    setToasts((prev) => [...prev, { id, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3000);
+  };
 
   // Проверка авторизации
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null);
+      setCurrentUserId(session?.user?.id ?? null);
       setLoading(false);
+      if (session?.user?.id) {
+        loadUserSettings(session.user.id);
+        loadProfile(session.user.id);
+      }
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
+      setCurrentUserId(session?.user?.id ?? null);
+      if (session?.user?.id) {
+        loadUserSettings(session.user.id);
+        loadProfile(session.user.id);
+      }
     });
 
     return () => subscription.unsubscribe();
@@ -66,24 +111,74 @@ function App() {
   // Загрузка магазинов
   useEffect(() => {
     if (user) {
-      loadStores();
+      loadStores(); // теперь – списки
+      loadShops();  // справочник магазинов
     }
   }, [user]);
 
-  // Загрузка списков
+  // Загрузка каталога при переходе на экран
   useEffect(() => {
-    if (currentStore) {
-      loadLists();
-      loadSortingRules();
+    if (currentView === 'catalog') {
+      syncCatalogFromLists().then(async () => {
+        await loadCatalog();
+        await loadAllCatalogPrices();
+      });
     }
-  }, [currentStore]);
+  }, [currentView]);
 
-  // Загрузка товаров
+  // Загрузка правил сортировки под выбранный магазин контекста
   useEffect(() => {
-    if (currentList) {
-      loadItems();
+    if (myStoreId) {
+      loadSortingRules();
+    } else {
+      setSortingRules({});
     }
-  }, [currentList]);
+  }, [myStoreId]);
+
+  // Загрузка товаров через TanStack Query
+  const { itemsQuery, addItem: addItemMutation, toggleChecked: toggleCheckedMutation, deleteItem: deleteItemMutation } = useListItems(currentList?.id);
+  useEffect(() => {
+    const apply = async () => {
+      if (!itemsQuery.data) return;
+      const list = itemsQuery.data;
+      try {
+        const map = await mapDisplayNamesForItems(list.map(i => i.name));
+        setItems(list.map(i => ({ ...i, display_name: map[i.name] || null })));
+      } catch {
+        setItems(list);
+      }
+    };
+    apply();
+  }, [itemsQuery.data]);
+
+  // Presence: сохраняем "мой магазин" для текущего списка
+  useEffect(() => {
+    const upsertPresence = async () => {
+      if (!currentList?.id || !currentUserId) return;
+      // Пустой выбор — удаляем запись
+      if (!myStoreId) {
+        await supabase.from('list_presence').delete().eq('list_id', currentList.id).eq('user_id', currentUserId);
+        return;
+      }
+      await supabase
+        .from('list_presence')
+        .upsert({ list_id: currentList.id, user_id: currentUserId, store_id: myStoreId });
+    };
+    upsertPresence();
+  }, [myStoreId, currentList?.id, currentUserId]);
+
+  // Загрузка намерений для текущих товаров
+  useEffect(() => {
+    if (items && items.length > 0) {
+      loadIntentionsForItems();
+      loadBestPrices();
+    } else {
+      setIntentions([]);
+      setIntentionsMap({});
+      setProfilesMap({});
+      setBestPrices({});
+    }
+  }, [items]);
 
   // Realtime подписки
   useEffect(() => {
@@ -129,10 +224,26 @@ function App() {
       .on('postgres_changes', { 
         event: '*', 
         schema: 'public', 
-        table: 'items',
+        table: 'list_items',
         filter: `list_id=eq.${currentList.id}`
-      }, () => {
-        loadItems();
+      }, (payload) => {
+        const { eventType, new: newRow, old } = payload;
+        setItems(prev => {
+          if (eventType === 'INSERT') {
+            if (prev.some(i => i.id === newRow.id)) return prev;
+            return [...prev, newRow].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+          }
+          if (eventType === 'UPDATE') {
+            if (newRow.checked && !old.checked) {
+              addToast(`Куплено: ${newRow.name}`);
+            }
+            return prev.map(i => i.id === newRow.id ? { ...i, ...newRow } : i);
+          }
+          if (eventType === 'DELETE') {
+            return prev.filter(i => i.id !== old.id);
+          }
+          return prev;
+        });
       })
       .subscribe();
 
@@ -141,16 +252,136 @@ function App() {
     };
   }, [currentList]);
 
+  // Realtime для намерений
+  const intentionsReloadTimer = useRef(null);
+  useEffect(() => {
+    if (!currentList) return;
+
+    const intentionsChannel = supabase
+      .channel('intentions-changes')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'item_intentions',
+      }, async (payload) => {
+        // debounce обновления намерений
+        if (intentionsReloadTimer.current) clearTimeout(intentionsReloadTimer.current);
+        intentionsReloadTimer.current = setTimeout(() => {
+          loadIntentionsForItems();
+        }, 200);
+        if (payload.eventType === 'INSERT') {
+          const uid = payload.new?.user_id;
+          if (uid && uid !== currentUserId) {
+            const userNick = profilesMap[uid] || 'Участник';
+            addToast(`${userNick} берёт: ${items.find(i => i.id === payload.new.list_item_id)?.name || 'товар'}`);
+          }
+        }
+      })
+      .subscribe();
+
+    return () => {
+      intentionsChannel.unsubscribe();
+    };
+  }, [currentList, items]);
+
+  // Realtime presence (кратко: собираем, кто в каком магазине)
+  useEffect(() => {
+    if (!currentList) return;
+    const channel = supabase
+      .channel('presence-changes')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'list_presence',
+        filter: `list_id=eq.${currentList.id}`,
+      }, async () => {
+        const { data } = await supabase
+          .from('list_presence')
+          .select('store_id, user_id')
+          .eq('list_id', currentList.id);
+        const map = {};
+        (data || []).forEach(r => {
+          if (!r.store_id) return;
+          map[r.store_id] = (map[r.store_id] || 0) + 1;
+        });
+        setPresenceMap(map);
+      })
+      .subscribe();
+    return () => channel.unsubscribe();
+  }, [currentList]);
+
   const loadStores = async () => {
+    // list-first: показываем списки пользователя
+    const { data, error } = await supabase
+      .from('shopping_lists')
+      .select('id, name, created_at')
+      .order('created_at', { ascending: false });
+    if (!error && data) setStores(data);
+  };
+
+  const loadShops = async () => {
     const { data, error } = await supabase
       .from('stores')
-      .select('*')
+      .select('id, name, created_at')
       .order('created_at', { ascending: false });
-    
-    if (!error && data) {
-      setStores(data);
+    if (!error && data) setShops(data);
+  };
+
+  const loadUserSettings = async (uid) => {
+    try {
+      const { data, error } = await supabase
+        .from('user_settings')
+        .select('show_authors, show_notifications')
+        .eq('user_id', uid)
+        .single();
+      if (!error && data) {
+        setShowAuthors(Boolean(data.show_authors));
+        if (data.show_notifications !== null && data.show_notifications !== undefined) {
+          setShowNotifications(Boolean(data.show_notifications));
+        }
+      }
+    } catch {}
+  };
+
+  const saveUserSettings = async () => {
+    try {
+      if (!currentUserId) return;
+      await supabase
+        .from('user_settings')
+        .upsert({ user_id: currentUserId, show_authors: showAuthors, show_notifications: showNotifications });
+      if (nickname.trim()) {
+        await supabase
+          .from('profiles')
+          .upsert({ user_id: currentUserId, nickname: nickname.trim() });
+      }
+      setShowSettings(false);
+    } catch (e) {
+      alert(e.message || 'Не удалось сохранить настройки');
     }
   };
+
+  const loadProfile = async (uid) => {
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('nickname')
+        .eq('user_id', uid)
+        .single();
+      if (!error && data) setNickname(data.nickname || '');
+    } catch {}
+  };
+
+  const loadBestPrices = async () => {
+    try {
+      const names = items.map(i => i.name);
+      const map = await fetchBestPricesForItemNames(names);
+      setBestPrices(map);
+    } catch (e) {
+      console.error('Failed to load best prices:', e);
+    }
+  };
+
+  // Удалён старый модальный редактор цен и связанные функции/состояния
 
   const loadLists = async () => {
     const { data, error } = await supabase
@@ -164,29 +395,54 @@ function App() {
     }
   };
 
-  const loadItems = async () => {
-    const { data, error } = await supabase
-      .from('items')
-      .select('*')
-      .eq('list_id', currentList.id)
-      .order('created_at', { ascending: true });
-    
-    if (!error && data) {
-      setItems(data);
+  const loadItems = async () => {};
+
+  const isUuid = (s) => /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(s || '');
+
+  const loadIntentionsForItems = async () => {
+    try {
+      const ids = items.map(i => i.id).filter(isUuid);
+      if (ids.length === 0) {
+        setIntentions([]);
+        setIntentionsMap({});
+        return;
+      }
+      const { data: intents, error } = await supabase
+        .from('item_intentions')
+        .select('*')
+        .in('list_item_id', ids);
+      if (error) throw error;
+      setIntentions(intents);
+      const map = {};
+      intents.forEach(it => { map[it.list_item_id] = it; });
+      setIntentionsMap(map);
+      const userIds = Array.from(new Set(intents.map(i => i.user_id).filter(Boolean)));
+      if (userIds.length > 0) {
+        const { data: profiles, error: pErr } = await supabase
+          .from('profiles')
+          .select('*')
+          .in('user_id', userIds);
+        if (pErr) throw pErr;
+        const pMap = {};
+        profiles.forEach(p => { pMap[p.user_id] = p.nickname; });
+        setProfilesMap(pMap);
+      } else {
+        setProfilesMap({});
+      }
+    } catch (e) {
+      console.error('Failed to load intentions:', e);
     }
   };
 
   const loadSortingRules = async () => {
+    if (!myStoreId) return;
     const { data, error } = await supabase
       .from('sorting_rules')
       .select('*')
-      .eq('store_id', currentStore.id);
-    
+      .eq('store_id', myStoreId);
     if (!error && data) {
       const rules = {};
-      data.forEach(rule => {
-        rules[rule.item_name_normalized] = rule.department;
-      });
+      data.forEach(rule => { rules[rule.item_name_normalized] = rule.department; });
       setSortingRules(rules);
     }
   };
@@ -256,56 +512,133 @@ function App() {
     return 'Разное';
   };
 
-  const addItem = async () => {
-    if (!newItemName.trim() || !currentList) return;
+  const addItem = async (overrideName) => {
+    const nameToAdd = (overrideName ?? newItemName).trim();
+    if (!nameToAdd || !currentList) return;
 
-    const department = await categorizeItem(newItemName);
-    const { error } = await supabase
-      .from('items')
-      .insert({
-        list_id: currentList.id,
-        name: newItemName.trim(),
-        quantity: newItemQuantity.trim(),
-        department
-      });
-
-    if (!error) {
+    // Если товар уже есть в списке — увеличиваем количество на 1 (или ставим 1, если пусто)
+    const normalizeLocal = (s) => (s || '').toLowerCase().trim();
+    const existing = items.find(i => normalizeLocal(i.name) === normalizeLocal(nameToAdd));
+    if (existing) {
+      const prevQty = parseFloat((existing.quantity || '').toString().replace(',', '.'));
+      const nextQty = isNaN(prevQty) ? 1 : prevQty + 1;
+      try {
+        await supabase.from('list_items').update({ quantity: String(nextQty) }).eq('id', existing.id);
+        setItems(prev => prev.map(it => it.id === existing.id ? { ...it, quantity: String(nextQty) } : it));
+      } catch (e) {
+        // офлайн — в очередь
+        await enqueueOp({ entity: 'item', type: 'update_qty', id: existing.id, quantity: String(nextQty), op_id: crypto.randomUUID?.() || `${Date.now()}` });
+        setPendingOps(await countPending());
+        addToast('Офлайн: обновлено количество');
+      }
       setNewItemName('');
       setNewItemQuantity('');
+      return;
+    }
+
+    const department = await categorizeItem(nameToAdd);
+    try {
+      await addItemMutation.mutateAsync({ name: nameToAdd, quantity: newItemQuantity, department });
+      try { await upsertCatalogNames([nameToAdd]); } catch {}
+    } catch (e) {
+      await enqueueOp({ entity: 'item', type: 'add', listId: currentList.id, name: nameToAdd, quantity: newItemQuantity, department, op_id: crypto.randomUUID?.() || `${Date.now()}` });
+      setPendingOps(await countPending());
+      addToast('Офлайн: товар добавлен в очередь');
+    }
+    setNewItemName('');
+    setNewItemQuantity('');
+  };
+
+  const claimItem = async (itemId) => {
+    try {
+      // оптимистично
+      setIntentionsMap(prev => ({ ...prev, [itemId]: { list_item_id: itemId, user_id: currentUserId, store_id: null } }));
+      await upsertIntention(itemId, null);
+    } catch (e) {
+      // откат
+      await loadIntentionsForItems();
+      alert(e.message || 'Не удалось отметить намерение');
+    }
+  };
+
+  const unclaimItem = async (itemId) => {
+    try {
+      // оптимистично
+      setIntentionsMap(prev => {
+        const copy = { ...prev };
+        delete copy[itemId];
+        return copy;
+      });
+      await clearIntention(itemId);
+    } catch (e) {
+      // откат
+      await loadIntentionsForItems();
+      alert(e.message || 'Не удалось снять намерение');
     }
   };
 
   const toggleItem = async (itemId, checked) => {
-    await supabase
-      .from('items')
-      .update({ checked: !checked })
-      .eq('id', itemId);
+    try {
+      const item = items.find(i => i.id === itemId);
+      await toggleCheckedMutation.mutateAsync({ id: itemId, checked, version: item?.version ?? 0 });
+    } catch (e) {
+      // офлайн/конфликт
+      if ((e?.message || '').includes('Failed to fetch')) {
+        const item = items.find(i => i.id === itemId);
+        await enqueueOp({ entity: 'item', type: 'toggle', id: itemId, checked: !checked, baseVersion: item?.version ?? 0 });
+        setPendingOps(await countPending());
+        addToast('Офлайн: действие поставлено в очередь');
+      } else {
+        alert(e.message || 'Не удалось обновить состояние товара');
+      }
+    }
   };
 
   const deleteItem = async (itemId) => {
-    await supabase.from('items').delete().eq('id', itemId);
+    try { await deleteItemMutation.mutateAsync(itemId); }
+    catch (e) {
+      await enqueueOp({ entity: 'item', type: 'delete', id: itemId });
+      setPendingOps(await countPending());
+      addToast('Офлайн: удаление в очереди');
+    }
   };
 
   const moveItemToDepartment = async (itemId, itemName, newDept) => {
-    await supabase
-      .from('items')
-      .update({ department: newDept })
-      .eq('id', itemId);
-    
-    const normalized = itemName.toLowerCase().trim();
-    await supabase
-      .from('sorting_rules')
-      .upsert({
-        store_id: currentStore.id,
-        item_name_normalized: normalized,
-        department: newDept
-      });
-    
-    loadSortingRules();
-    setShowDepartmentPicker(false);
-    setMovingItem(null);
-    setShowNewDepartment(false);
-    setNewDepartmentName('');
+    const prev = items;
+    // оптимистично
+    setItems(prev => prev.map(i => i.id === itemId ? { ...i, department: newDept } : i));
+    try {
+      await supabase
+        .from('items')
+        .update({ department: newDept })
+        .eq('id', itemId);
+      const normalized = itemName.toLowerCase().trim();
+      if (myStoreId) {
+        await supabase
+          .from('sorting_rules')
+          .upsert({
+            store_id: myStoreId,
+            item_name_normalized: normalized,
+            department: newDept
+          });
+      }
+      loadSortingRules();
+    } catch (e) {
+      if ((e?.message || '').includes('Failed to fetch')) {
+        await enqueueOp({ entity: 'item', type: 'move', id: itemId, department: newDept });
+        setPendingOps(await countPending());
+        addToast('Офлайн: перенос в очереди');
+      } else {
+        // откат
+        setItems(prev);
+        alert(e.message || 'Не удалось переместить товар');
+      }
+    } finally {
+      setShowDepartmentPicker(false);
+      setMovingItem(null);
+      setShowNewDepartment(false);
+      setNewDepartmentName('');
+    }
   };
 
   const createNewDepartment = () => {
@@ -321,13 +654,88 @@ function App() {
   };
 
   const addStore = async () => {
-    const name = window.prompt('Название магазина:');
+    const name = window.prompt('Название списка:');
     if (!name || !name.trim()) return;
     
     const { error } = await supabase
-      .from('stores')
+      .from('shopping_lists')
       .insert({ name: name.trim(), owner_id: user.id });
     if (!error) loadStores();
+  };
+
+  // CRUD магазинов
+  const addShop = async () => {
+    const name = window.prompt('Название магазина:');
+    if (!name || !name.trim()) return;
+    const { error } = await supabase.from('stores').insert({ name: name.trim(), owner_id: user.id });
+    if (!error) loadShops();
+  };
+
+  // Каталог товаров
+  const loadCatalog = async () => {
+    try {
+      setCatalog(await fetchCatalog());
+    } catch (e) { console.error(e); }
+  };
+
+  // Подтягивает уникальные имена из list_items и item_prices в каталог
+  const syncCatalogFromLists = async () => {
+    try {
+      const names = new Set();
+      const { data: li } = await supabase.from('list_items').select('name');
+      (li || []).forEach(r => r?.name && names.add(r.name));
+      const { data: ip } = await supabase.from('item_prices').select('item_full_name, item_name_normalized');
+      (ip || []).forEach(r => names.add(r.item_full_name || r.item_name_normalized));
+      await upsertCatalogNames(Array.from(names));
+    } catch (e) { /* мягко игнорируем */ }
+  };
+
+  const loadAllCatalogPrices = async () => {
+    try {
+      const pMap = {};
+      const aMap = {};
+      for (const item of await fetchCatalog()) {
+        pMap[item.id] = await fetchPricesForCatalogItem(item.id);
+        aMap[item.id] = await fetchAliases(item.id);
+      }
+      setCatalogPrices(pMap);
+      setCatalogAliases(aMap);
+    } catch (e) { console.error(e); }
+  };
+
+  const addCatalog = async () => {
+    const name = window.prompt('Название товара:');
+    if (!name || !name.trim()) return;
+    await addCatalogItem(name);
+    await loadCatalog();
+    await loadAllCatalogPrices();
+  };
+
+  const renameCatalog = async (item) => {
+    const name = window.prompt('Новое название товара:', item.short_name);
+    if (!name || !name.trim()) return;
+    await renameCatalogItem(item.id, name);
+    await loadCatalog();
+  };
+
+  const deleteCatalogEntry = async (item) => {
+    if (!window.confirm(`Удалить товар "${item.short_name}" из каталога?`)) return;
+    await deleteCatalogItem(item.id);
+    await loadCatalog();
+    await loadAllCatalogPrices();
+  };
+
+  const renameShop = async (shop) => {
+    const name = window.prompt('Новое название магазина:', shop.name);
+    if (!name || !name.trim()) return;
+    const { error } = await supabase.from('stores').update({ name: name.trim() }).eq('id', shop.id);
+    if (!error) loadShops();
+  };
+
+  const deleteShop = async (shop) => {
+    if (!window.confirm(`Удалить магазин "${shop.name}"?`)) return;
+    const { error } = await supabase.from('stores').delete().eq('id', shop.id);
+    if (!error) loadShops();
   };
 
   const addList = async () => {
@@ -339,6 +747,43 @@ function App() {
       .insert({ store_id: currentStore.id, name: name.trim() });
     if (!error) loadLists();
   };
+
+  // Присоединение к списку по коду (новая схема list-first)
+  const acceptJoinCode = async () => {
+    const code = joinCode.trim();
+    if (!code) return;
+    try {
+      const { data, error } = await supabase.rpc('accept_join_code', { p_code: code });
+      if (error) throw error;
+      setShowJoin(false);
+      setJoinCode('');
+      alert('Вы присоединились к списку!');
+    } catch (e) {
+      alert(e.message || 'Не удалось присоединиться. Проверьте код.');
+    }
+  };
+
+  // Поиск подсказок при вводе (размещён ДО ранних return, чтобы не ломать порядок hooks)
+  useEffect(() => {
+    if (currentView !== 'shopping') return;
+    if (typeaheadTimer.current) clearTimeout(typeaheadTimer.current);
+    const term = newItemName;
+    if (!term || !term.trim()) {
+      setTypeaheadItems([]);
+      setTypeaheadOpen(false);
+      return;
+    }
+    typeaheadTimer.current = setTimeout(async () => {
+      try {
+        const list = await searchCatalogSuggestions(term, 8);
+        setTypeaheadItems(list);
+        setTypeaheadOpen(true);
+      } catch (e) {
+        // мягко игнорируем
+      }
+    }, 150);
+    return () => typeaheadTimer.current && clearTimeout(typeaheadTimer.current);
+  }, [newItemName, currentView]);
 
   if (loading) {
     return (
@@ -377,11 +822,11 @@ function App() {
           </div>
 
           <div className="space-y-4">
-            <input
+              <input
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && signIn()}
+              onKeyDown={(e) => e.key === 'Enter' && signIn()}
               placeholder="Email"
               className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
@@ -389,7 +834,7 @@ function App() {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && signIn()}
+              onKeyDown={(e) => e.key === 'Enter' && signIn()}
               placeholder="Пароль"
               className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
@@ -412,23 +857,46 @@ function App() {
     );
   }
 
+  const normalize = (s) => (s || '').toLowerCase().trim();
+
+  // Фильтр по "моему" магазину
+  const filteredItems = filterMyStore && myStoreId
+    ? items.filter(it => bestPrices[normalize(it.name)]?.store_id === myStoreId)
+    : items;
+
+  // (удалено дублирование хука)
+
   // Группировка товаров по отделам
   const departments = {};
-  items.forEach(item => {
+  filteredItems.forEach(item => {
     if (!departments[item.department]) {
       departments[item.department] = [];
     }
     departments[item.department].push(item);
   });
 
-  // Экран магазинов
+  // Экран списков (list-first)
   if (currentView === 'stores') {
     return (
       <div className="min-h-screen bg-gray-50 p-4">
         <div className="max-w-md mx-auto">
           <div className="flex justify-between items-center mb-6">
-            <h1 className="text-2xl font-bold text-gray-800">Мои магазины</h1>
+            <h1 className="text-2xl font-bold text-gray-800">Мои списки</h1>
             <div className="flex gap-2">
+              <button
+                onClick={() => setCurrentView('catalog')}
+                className="p-2 text-gray-600 hover:bg-gray-200 rounded-lg"
+                title="Каталог товаров"
+              >
+                Каталог
+              </button>
+              <button
+                onClick={() => setCurrentView('manageShops')}
+                className="p-2 text-gray-600 hover:bg-gray-200 rounded-lg"
+                title="Мои магазины"
+              >
+                Магазины
+              </button>
               <button 
                 onClick={() => setShowSettings(true)} 
                 className="p-2 text-gray-600 hover:bg-gray-200 rounded-lg"
@@ -445,16 +913,16 @@ function App() {
           </div>
 
           <div className="space-y-3">
-            {stores.map(store => (
+            {stores.map(list => (
               <button
-                key={store.id}
+                key={list.id}
                 onClick={() => {
-                  setCurrentStore(store);
-                  setCurrentView('lists');
+                  setCurrentList(list);
+                  setCurrentView('shopping');
                 }}
                 className="w-full p-4 bg-white rounded-lg shadow hover:shadow-md transition-shadow text-left"
               >
-                <div className="font-semibold text-lg">{store.name}</div>
+                <div className="font-semibold text-lg">{list.name}</div>
               </button>
             ))}
           </div>
@@ -463,7 +931,14 @@ function App() {
             onClick={addStore}
             className="w-full mt-4 p-4 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-semibold"
           >
-            + Добавить магазин
+            + Создать список
+          </button>
+
+          <button
+            onClick={() => setShowJoin(true)}
+            className="w-full mt-3 p-3 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium"
+          >
+            Присоединиться по коду
           </button>
         </div>
 
@@ -494,13 +969,61 @@ function App() {
                 <p className="text-xs text-gray-500 mt-1">
                   Для AI-сортировки. Без ключа используется базовая сортировка.
                 </p>
+                <div className="mt-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Мой никнейм</label>
+                  <input
+                    type="text"
+                    value={nickname}
+                    onChange={(e) => setNickname(e.target.value)}
+                    placeholder="Напр.: Dan"
+                    className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  />
+                </div>
+              </div>
+
+              <div className="mt-4 flex items-center gap-2">
+                <input id="showAuthors" type="checkbox" checked={showAuthors} onChange={(e) => setShowAuthors(e.target.checked)} />
+                <label htmlFor="showAuthors" className="text-sm text-gray-800">Показывать авторов действий</label>
+              </div>
+
+              <div className="mt-2 flex items-center gap-2">
+                <input id="showNotifications" type="checkbox" checked={showNotifications} onChange={(e) => setShowNotifications(e.target.checked)} />
+                <label htmlFor="showNotifications" className="text-sm text-gray-800">Показывать уведомления</label>
               </div>
 
               <button
-                onClick={() => setShowSettings(false)}
+                onClick={saveUserSettings}
                 className="w-full mt-6 p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
               >
                 Сохранить
+              </button>
+            </div>
+          </div>
+        )}
+
+        {showJoin && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end sm:items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full max-w-md p-6">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold">Присоединиться по коду</h2>
+                <button onClick={() => setShowJoin(false)} className="p-1">
+                  <X size={24} />
+                </button>
+              </div>
+              <input
+                type="text"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && acceptJoinCode()}
+                placeholder="Код, например: bf913941ecd5"
+                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+              <button
+                onClick={acceptJoinCode}
+                disabled={!joinCode.trim()}
+                className="w-full mt-4 p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+              >
+                Присоединиться
               </button>
             </div>
           </div>
@@ -550,6 +1073,191 @@ function App() {
     );
   }
 
+  // Экран каталога товаров (компактный список с раскрытием деталей)
+  if (currentView === 'catalog') {
+    const filtered = catalog.filter(c =>
+      !catalogSearch.trim() || c.short_name.toLowerCase().includes(catalogSearch.toLowerCase())
+    );
+    return (
+      <div className="min-h-screen bg-gray-50 p-4">
+        <div className="max-w-md mx-auto">
+          <div className="flex items-center gap-3 mb-4">
+            <button onClick={() => setCurrentView('stores')} className="p-2 text-gray-600 hover:bg-gray-200 rounded-lg">
+              <ArrowLeft size={24} />
+            </button>
+            <h1 className="text-2xl font-bold">Каталог товаров</h1>
+          </div>
+
+          <input
+            type="text"
+            value={catalogSearch}
+            onChange={e => setCatalogSearch(e.target.value)}
+            placeholder="Поиск по названию"
+            className="w-full mb-3 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          />
+
+          <div className="divide-y rounded-lg shadow bg-white">
+            {filtered.map(item => (
+              <details key={item.id} className="p-3 group">
+                <summary className="flex items-center justify-between cursor-pointer list-none">
+                  <div className="flex items-center gap-2 w-full">
+                    <span className="font-medium truncate" title={item.short_name}>{item.short_name}</span>
+                    <span className="text-xs text-gray-500">{item.unit || '—'}</span>
+                  </div>
+                  <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onClick={() => renameCatalog(item)} className="text-blue-600 hover:underline text-sm">Переименовать</button>
+                    <button onClick={() => deleteCatalogEntry(item)} className="text-red-600 hover:underline text-sm">Удалить</button>
+                  </div>
+                </summary>
+
+                <div className="pt-3 space-y-3">
+                  {/* Полное название */}
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="w-40 text-gray-500">Полное имя</span>
+                    <input
+                      defaultValue={item.display_name || ''}
+                      placeholder="Напр.: Пиво Warsteiner Extra..."
+                      className="flex-1 p-2 border rounded"
+                      onBlur={async (e) => {
+                        const val = e.target.value;
+                        const updated = await updateCatalogDisplayName(item.id, val);
+                        if (updated) setCatalog(prev => prev.map(c => c.id === item.id ? updated : c));
+                      }}
+                    />
+                  </div>
+
+                  {/* Единица измерения */}
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="w-40 text-gray-500">Единица измерения</span>
+                    <select defaultValue={item.unit || ''} className="p-2 border rounded"
+                      onChange={async (e) => {
+                        const updated = await updateCatalogUnit(item.id, e.target.value || null);
+                        if (updated) setCatalog(prev => prev.map(c => c.id === item.id ? updated : c));
+                      }}>
+                      <option value="">—</option>
+                      <option value="шт">шт</option>
+                      <option value="кг">кг</option>
+                      <option value="г">г</option>
+                      <option value="л">л</option>
+                      <option value="мл">мл</option>
+                    </select>
+                  </div>
+
+                  {/* Алиасы */}
+                  <div className="text-sm">
+                    <div className="text-gray-500 mb-1">Полные названия:</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(catalogAliases[item.id] || []).map(al => (
+                        <span key={al.id} className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 rounded">
+                          {al.full_name}
+                          <button onClick={() => deleteAlias(al.id)} className="text-red-600">×</button>
+                        </span>
+                      ))}
+                      <button
+                        onClick={async () => {
+                          const full = window.prompt('Полное название товара');
+                          if (!full || !full.trim()) return;
+                          await addAlias(item.id, full);
+                          const list = await fetchAliases(item.id);
+                          setCatalogAliases(prev => ({ ...prev, [item.id]: list }));
+                        }}
+                        className="text-blue-600 hover:underline"
+                      >+ добавить алиас</button>
+                    </div>
+                  </div>
+
+                  {/* Цены по магазинам */}
+                  <div className="text-sm">
+                    <div className="text-gray-500 mb-1">Цены по магазинам:</div>
+                    <div className="space-y-2">
+                      {shops.map(s => {
+                        const rec = (catalogPrices[item.id] || {})[s.id] || {};
+                        let p = rec.price ?? '';
+                        let q = rec.quantity ?? '';
+                        return (
+                          <div key={s.id} className="flex items-center gap-2">
+                            <div className="w-32 truncate" title={s.name}>{s.name}</div>
+                            <input defaultValue={q} placeholder="Кол-во" className="w-20 p-2 border rounded"
+                              onChange={(e) => { q = e.target.value }} />
+                            <input defaultValue={p} placeholder="Цена" className="w-24 p-2 border rounded"
+                              onChange={(e) => { p = e.target.value }} />
+                            <button
+                              onClick={async () => {
+                                await upsertItemPriceByCatalogId(s.id, item.id, Number(p), (q || '').trim());
+                                const updated = await fetchPricesForCatalogItem(item.id);
+                                setCatalogPrices(prev => ({ ...prev, [item.id]: updated }));
+                              }}
+                              className="px-3 py-2 bg-blue-500 text-white rounded"
+                            >Сохранить</button>
+                            {rec.price != null && (
+                              <button
+                                onClick={async () => {
+                                  await deletePriceByCatalogId(s.id, item.id);
+                                  const updated = await fetchPricesForCatalogItem(item.id);
+                                  setCatalogPrices(prev => ({ ...prev, [item.id]: updated }));
+                                }}
+                                className="px-3 py-2 bg-red-500 text-white rounded"
+                              >Удалить</button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </details>
+            ))}
+          </div>
+
+          <button
+            onClick={addCatalog}
+            className="w-full mt-4 p-4 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-semibold"
+          >
+            + Добавить товар
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Экран управления магазинами
+  if (currentView === 'manageShops') {
+    return (
+      <div className="min-h-screen bg-gray-50 p-4">
+        <div className="max-w-md mx-auto">
+          <div className="flex items-center gap-3 mb-6">
+            <button 
+              onClick={() => setCurrentView('stores')} 
+              className="p-2 text-gray-600 hover:bg-gray-200 rounded-lg"
+            >
+              <ArrowLeft size={24} />
+            </button>
+            <h1 className="text-2xl font-bold">Мои магазины</h1>
+          </div>
+
+          <div className="space-y-3">
+            {shops.map(shop => (
+              <div key={shop.id} className="flex items-center justify-between p-4 bg-white rounded-lg shadow">
+                <div className="font-semibold">{shop.name}</div>
+                <div className="flex gap-2">
+                  <button onClick={() => renameShop(shop)} className="text-blue-600 hover:underline text-sm">Переименовать</button>
+                  <button onClick={() => deleteShop(shop)} className="text-red-600 hover:underline text-sm">Удалить</button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <button
+            onClick={addShop}
+            className="w-full mt-4 p-4 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-semibold"
+          >
+            + Добавить магазин
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // Экран покупок
   return (
     <div className="min-h-screen bg-gray-50 pb-24">
@@ -563,7 +1271,26 @@ function App() {
               ← Назад
             </button>
             <h1 className="text-xl font-bold">{currentList?.name}</h1>
-            <div className="w-16"></div>
+            <div className="flex items-center gap-2">
+              {pendingOps > 0 && (
+                <button
+                  onClick={async () => {
+                    try {
+                      await syncOnce();
+                      setPendingOps(await countPending());
+                      addToast('Синхронизация завершена');
+                    } catch (e) {
+                      addToast('Не удалось синхронизировать');
+                    }
+                  }}
+                  className="text-xs bg-amber-100 text-amber-700 px-2 py-1 rounded border border-amber-200"
+                  title="Синхронизировать офлайн-очередь"
+                >
+                  Синхронизация ({pendingOps})
+                </button>
+              )}
+              <div className="w-4" />
+            </div>
           </div>
 
           <div className="flex gap-2">
@@ -571,7 +1298,7 @@ function App() {
               type="text"
               value={newItemName}
               onChange={(e) => setNewItemName(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && addItem()}
+              onKeyDown={(e) => e.key === 'Enter' && addItem()}
               placeholder="Товар"
               className="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
@@ -579,7 +1306,7 @@ function App() {
               type="text"
               value={newItemQuantity}
               onChange={(e) => setNewItemQuantity(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && addItem()}
+              onKeyDown={(e) => e.key === 'Enter' && addItem()}
               placeholder="Кол-во"
               className="w-20 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
@@ -591,6 +1318,34 @@ function App() {
             </button>
           </div>
 
+          {/* Bottom sheet подсказок */}
+          {typeaheadOpen && typeaheadItems.length > 0 && (
+            <div className="fixed inset-x-0 bottom-0 z-40">
+              <div className="mx-auto max-w-md bg-white shadow-2xl border-t rounded-t-2xl p-2">
+                {typeaheadItems.map(s => (
+                  <button
+                    key={s.id}
+                    onClick={async () => {
+                      await addItem(s.short_name);
+                      setTypeaheadOpen(false);
+                    }}
+                    className="w-full text-left px-3 py-3 hover:bg-gray-100 rounded-lg flex items-center justify-between"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-medium truncate">{s.short_name}</div>
+                      {s.display_name && <div className="text-xs text-gray-500 truncate">{s.display_name}</div>}
+                    </div>
+                    {s.unit && <span className="text-xs text-gray-500 ml-3">{s.unit}</span>}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setTypeaheadOpen(false)}
+                  className="w-full py-2 text-sm text-gray-600"
+                >Скрыть</button>
+              </div>
+            </div>
+          )}
+
           <button
             onClick={uncheckAll}
             className="w-full mt-3 p-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors text-sm font-medium flex items-center justify-center gap-1"
@@ -598,6 +1353,34 @@ function App() {
             <RotateCcw size={16} />
             Снять все
           </button>
+
+          <button
+            onClick={loadBestPrices}
+            className="w-full mt-2 p-2 bg-emerald-100 text-emerald-700 rounded-lg hover:bg-emerald-200 transition-colors text-sm font-medium"
+            title="Пересчитать рекомендации по ценам"
+          >
+            Оптимизировать (цены)
+          </button>
+
+          {/* Мой магазин и фильтр */}
+          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <select
+              value={myStoreId}
+              onChange={(e) => setMyStoreId(e.target.value)}
+              className="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+            >
+              <option value="">Мой магазин не выбран</option>
+              {shops.map(shop => (
+                <option key={shop.id} value={shop.id}>
+                  {shop.name}{presenceMap[shop.id] ? ` · ${presenceMap[shop.id]}` : ''}
+                </option>
+              ))}
+            </select>
+            <label className="flex items-center gap-2 text-sm text-gray-700 bg-gray-50 p-2 rounded-lg border border-gray-200">
+              <input type="checkbox" checked={filterMyStore} onChange={(e) => setFilterMyStore(e.target.checked)} />
+              Показать для моего магазина
+            </label>
+          </div>
         </div>
       </div>
 
@@ -632,22 +1415,66 @@ function App() {
                         className={`flex-shrink-0 w-6 h-6 rounded border-2 flex items-center justify-center transition-colors ${
                           item.checked
                             ? 'bg-green-500 border-green-500'
-                            : 'border-gray-300 hover:border-green-500'
+                            : `border-gray-300 hover:border-green-500 ${item.__conflict ? 'ring-2 ring-red-400' : ''}`
                         }`}
                       >
                         {item.checked && <Check size={16} className="text-white" />}
                       </button>
 
                       <div className="flex-1 min-w-0">
-                        <div className={`font-medium ${item.checked ? 'line-through text-gray-500' : 'text-gray-800'}`}>
-                          {item.name}
-                        </div>
+                        <div className={`font-medium ${item.checked ? 'line-through text-gray-500' : 'text-gray-800'}`}>{item.name}</div>
+                        {item.display_name && (
+                          <div className={`text-xs ${item.checked ? 'text-gray-400' : 'text-gray-500'} truncate`}>{item.display_name}</div>
+                        )}
                         {item.quantity && (
-                          <div className={`text-sm ${item.checked ? 'text-gray-400' : 'text-gray-600'}`}>
-                            {item.quantity}
+                          <div className={`text-sm ${item.checked ? 'text-gray-400' : 'text-gray-600'}`}>{item.quantity}</div>
+                        )}
+                        {/* Чип цены/магазина */}
+                        {bestPrices[item.name.toLowerCase().trim()] && (
+                          <div className="mt-1 flex items-center gap-2 flex-wrap">
+                            <span className="inline-flex items-center text-xs px-2 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+                              {bestPrices[item.name.toLowerCase().trim()].store_name}
+                              <span className="mx-1">·</span>
+                              {bestPrices[item.name.toLowerCase().trim()].price}
+                            </span>
+                            {myStoreId && bestPrices[item.name.toLowerCase().trim()].store_id === myStoreId && (
+                              <span className="inline-flex items-center text-xs px-2 py-1 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                                Рекомендовано здесь
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {item.__conflict && (
+                          <div className="text-xs text-red-500 mt-1">Конфликт версии — обновите</div>
+                        )}
+                        {showAuthors && intentionsMap[item.id] && (
+                          <div className="text-xs text-blue-500 mt-1">
+                            {intentionsMap[item.id].user_id === currentUserId
+                              ? 'Вы берёте этот товар'
+                              : `Берёт: ${profilesMap[intentionsMap[item.id].user_id] || 'участник'}`}
                           </div>
                         )}
                       </div>
+
+                      {!item.checked && (
+                        intentionsMap[item.id]?.user_id === currentUserId ? (
+                          <button
+                            onClick={() => unclaimItem(item.id)}
+                            className="flex-shrink-0 px-2 py-1 text-xs bg-blue-50 text-blue-600 rounded hover:bg-blue-100"
+                            title="Снять намерение"
+                          >
+                            Снять
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => claimItem(item.id)}
+                            className="flex-shrink-0 px-2 py-1 text-xs bg-blue-500 text-white rounded hover:bg-blue-600"
+                            title="Я возьму"
+                          >
+                            Я возьму
+                          </button>
+                        )
+                      )}
 
                       <button
                         onClick={() => {
@@ -755,7 +1582,7 @@ function App() {
               type="text"
               value={newDepartmentName}
               onChange={(e) => setNewDepartmentName(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && createNewDepartment()}
+              onKeyDown={(e) => e.key === 'Enter' && createNewDepartment()}
               placeholder="Название отдела"
               autoFocus
               className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent mb-4"
@@ -771,6 +1598,8 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* Удалён устаревший модальный редактор цен */}
     </div>
   );
 }
