@@ -934,7 +934,15 @@ function App() {
           setStores(prev => prev.filter(l => l.id !== list.id));
         } else if (newOwnerId) {
           await reassignOwner(list.id, newOwnerId);
-          addToast('Владелец назначен');
+          // После передачи владения выходим из участников и скрываем список у себя
+          try { await removeMember(list.id, currentUserId); } catch (_) {}
+          setStores(prev => prev.filter(l => l.id !== list.id));
+          setListMembersMap(prev => {
+            const copy = { ...prev };
+            if (copy[list.id]) copy[list.id] = copy[list.id].filter(m => m.user_id !== currentUserId);
+            return copy;
+          });
+          addToast('Владелец назначен и список скрыт у вас');
         } else {
           // удалить у всех
           await deleteListEverywhere(list.id);
@@ -1372,7 +1380,7 @@ function App() {
                             <option key={m.user_id} value={m.user_id}>{m.nickname || m.user_id}</option>
                           ))}
                         </select>
-                        <button onClick={confirmDeleteAction} disabled={!newOwnerId} className="w-full p-3 bg-blue-500 text-white rounded-lg disabled:bg-gray-300">Назначить владельца</button>
+                        <button onClick={confirmDeleteAction} disabled={!newOwnerId} className="w-full p-3 bg-blue-500 text-white rounded-lg disabled:bg-gray-300">Назначить владельца и удалить у меня</button>
                       </div>
                       <div className="pt-2">
                         <button onClick={() => { setNewOwnerId(''); confirmDeleteAction(); }} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Удалить у всех</button>
