@@ -6,7 +6,7 @@ import { fetchBestPricesForItemNames, upsertItemPriceByCatalogId, fetchPricesFor
 import { fetchCatalog, addCatalogItem, renameCatalogItem, deleteCatalogItem, upsertCatalogNames, fetchAliases, addAlias, deleteAlias, updateCatalogUnit, updateCatalogDisplayName, searchCatalogSuggestions, mapDisplayNamesForItems } from './services/catalog';
 import { useListItems } from './hooks/useListItems';
 import { enqueueOp, countPending, syncOnce } from './offline/queue';
-import { generateJoinCode, fetchMembersForLists, removeMember } from './services/lists';
+import { generateJoinCode, fetchMembersForLists, removeMember, reassignOwner, deleteListEverywhere } from './services/lists';
 
 // Supabase клиент вынесен в ./lib/supabaseClient
 
@@ -128,6 +128,9 @@ function App() {
   const [pendingOps, setPendingOps] = useState(0);
   const [presenceMap, setPresenceMap] = useState({});
   const [listMembersMap, setListMembersMap] = useState({}); // {listId: [{user_id, nickname}]}
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deleteTargetList, setDeleteTargetList] = useState(null);
+  const [newOwnerId, setNewOwnerId] = useState('');
 
   const addToast = (message) => {
     if (!showNotifications) return;
@@ -893,6 +896,62 @@ function App() {
     }
   };
 
+  const handleLeaveList = async (listId) => {
+    if (!currentUserId) return;
+    if (!window.confirm('Удалить этот список у себя? Вы сможете присоединиться снова по коду.')) return;
+    try {
+      await removeMember(listId, currentUserId);
+      // убрать из локального списка
+      setStores(prev => prev.filter(l => l.id !== listId));
+      setListMembersMap(prev => {
+        const copy = { ...prev };
+        if (copy[listId]) copy[listId] = copy[listId].filter(m => m.user_id !== currentUserId);
+        return copy;
+      });
+      addToast('Список скрыт');
+    } catch (e) {
+      alert(e.message || 'Не удалось выйти из списка');
+    }
+  };
+
+  const openDeleteModal = (list) => {
+    setDeleteTargetList(list);
+    setNewOwnerId('');
+    setShowDeleteModal(true);
+  };
+
+  const confirmDeleteAction = async () => {
+    const list = deleteTargetList;
+    if (!list) return;
+    try {
+      if (list.owner_id === currentUserId) {
+        // владелец
+        const members = (listMembersMap[list.id] || []);
+        const others = members.filter(m => m.user_id !== currentUserId);
+        if (others.length === 0) {
+          // один — удалить навсегда
+          await deleteListEverywhere(list.id);
+          setStores(prev => prev.filter(l => l.id !== list.id));
+        } else if (newOwnerId) {
+          await reassignOwner(list.id, newOwnerId);
+          addToast('Владелец назначен');
+        } else {
+          // удалить у всех
+          await deleteListEverywhere(list.id);
+          setStores(prev => prev.filter(l => l.id !== list.id));
+        }
+      } else {
+        // чужой — выйти
+        await removeMember(list.id, currentUserId);
+        setStores(prev => prev.filter(l => l.id !== list.id));
+      }
+      setShowDeleteModal(false);
+      setDeleteTargetList(null);
+    } catch (e) {
+      alert(e.message || 'Операция не выполнена');
+    }
+  };
+
   const handleRemoveMember = async (listId, userId) => {
     if (!window.confirm('Удалить участника из списка?')) return;
     try {
@@ -1069,27 +1128,39 @@ function App() {
           <div className="space-y-3">
             {myLists.map(list => (
               <div key={list.id} className="p-4 bg-white rounded-lg shadow">
-                <button
-                  onClick={() => {
-                    setCurrentList(list);
-                    setCurrentView('shopping');
-                  }}
-                  className="w-full text-left"
-                >
-                  <div className="font-semibold text-lg">{list.name}</div>
-                </button>
+                <div className="flex items-center justify-between gap-3">
+                  <button
+                    onClick={() => {
+                      setCurrentList(list);
+                      setCurrentView('shopping');
+                    }}
+                    className="text-left flex-1"
+                  >
+                    <div className="font-semibold text-lg">{list.name}</div>
+                  </button>
+                  <button
+                    onClick={() => openDeleteModal(list)}
+                    className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg text-red-600 hover:bg-red-50"
+                    title="Удалить / выйти"
+                    aria-label="Удалить список"
+                  >
+                    <X size={20} />
+                  </button>
+                </div>
                 {/* Чипы участников */}
                 <div className="mt-2 flex flex-wrap gap-2">
-                  {(listMembersMap[list.id] || []).map(m => (
+                  {(listMembersMap[list.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
                     <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
                       {m.nickname || 'Участник'}
-                      <button
-                        onClick={() => handleRemoveMember(list.id, m.user_id)}
-                        className="ml-1 text-red-600 hover:text-red-800"
-                        title="Удалить из списка"
-                      >
-                        ×
-                      </button>
+                      {m.user_id !== list.owner_id && (
+                        <button
+                          onClick={() => handleRemoveMember(list.id, m.user_id)}
+                          className="ml-1 text-red-600 hover:text-red-800"
+                          title="Удалить из списка"
+                        >
+                          ×
+                        </button>
+                      )}
                     </span>
                   ))}
                 </div>
@@ -1103,26 +1174,38 @@ function App() {
               <div className="space-y-3">
                 {sharedLists.map(list => (
                   <div key={list.id} className="p-4 bg-white rounded-lg shadow">
-                    <button
-                      onClick={() => {
-                        setCurrentList(list);
-                        setCurrentView('shopping');
-                      }}
-                      className="w-full text-left"
-                    >
-                      <div className="font-semibold text-lg">{list.name}</div>
-                    </button>
+                    <div className="flex items-center justify-between gap-3">
+                      <button
+                        onClick={() => {
+                          setCurrentList(list);
+                          setCurrentView('shopping');
+                        }}
+                        className="text-left flex-1"
+                      >
+                        <div className="font-semibold text-lg">{list.name}</div>
+                      </button>
+                      <button
+                        onClick={() => openDeleteModal(list)}
+                        className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg text-red-600 hover:bg-red-50"
+                        title="Удалить / выйти"
+                        aria-label="Удалить список"
+                      >
+                        <X size={20} />
+                      </button>
+                    </div>
                     <div className="mt-2 flex flex-wrap gap-2">
-                      {(listMembersMap[list.id] || []).map(m => (
+                      {(listMembersMap[list.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
                         <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
                           {m.nickname || 'Участник'}
-                          <button
-                            onClick={() => handleRemoveMember(list.id, m.user_id)}
-                            className="ml-1 text-red-600 hover:text-red-800"
-                            title="Удалить из списка"
-                          >
-                            ×
-                          </button>
+                          {m.user_id !== list.owner_id && (
+                            <button
+                              onClick={() => handleRemoveMember(list.id, m.user_id)}
+                              className="ml-1 text-red-600 hover:text-red-800"
+                              title="Удалить из списка"
+                            >
+                              ×
+                            </button>
+                          )}
                         </span>
                       ))}
                     </div>
@@ -1852,6 +1935,50 @@ function App() {
             >
               + Создать новый отдел
             </button>
+          </div>
+        </div>
+      )}
+
+      {showDeleteModal && deleteTargetList && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end sm:items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full max-w-md p-6">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold">Удаление списка</h2>
+              <button onClick={() => setShowDeleteModal(false)} className="p-1"><X size={24} /></button>
+            </div>
+
+            {deleteTargetList.owner_id === currentUserId ? (
+              <div className="space-y-3 text-sm">
+                {((listMembersMap[deleteTargetList.id] || []).filter(m => m.user_id !== currentUserId).length === 0) ? (
+                  <>
+                    <p>Список не расшарен. Удалить навсегда?</p>
+                    <button onClick={confirmDeleteAction} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Удалить навсегда</button>
+                  </>
+                ) : (
+                  <>
+                    <p>Список расшарен. Выберите действие:</p>
+                    <div className="space-y-2">
+                      <label className="block">Назначить владельца:</label>
+                      <select value={newOwnerId} onChange={e => setNewOwnerId(e.target.value)} className="w-full p-2 border rounded">
+                        <option value="">— Выберите пользователя —</option>
+                        {(listMembersMap[deleteTargetList.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
+                          <option key={m.user_id} value={m.user_id}>{m.nickname || m.user_id}</option>
+                        ))}
+                      </select>
+                      <button onClick={confirmDeleteAction} disabled={!newOwnerId} className="w-full p-3 bg-blue-500 text-white rounded-lg disabled:bg-gray-300">Назначить владельца</button>
+                    </div>
+                    <div className="pt-2">
+                      <button onClick={() => { setNewOwnerId(''); confirmDeleteAction(); }} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Удалить у всех</button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-3 text-sm">
+                <p>Выйти из участников и удалить список у себя?</p>
+                <button onClick={confirmDeleteAction} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Выйти и удалить у меня</button>
+              </div>
+            )}
           </div>
         </div>
       )}

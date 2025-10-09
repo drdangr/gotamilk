@@ -87,4 +87,22 @@ export async function removeMember(listId, userId) {
   if (error) throw error;
 }
 
+// Переназначает владельца списка
+export async function reassignOwner(listId, newOwnerUserId) {
+  const { error } = await supabase
+    .from('shopping_lists')
+    .update({ owner_id: newOwnerUserId })
+    .eq('id', listId);
+  if (error) throw error;
+}
+
+// Удаляет список для всех (только владелец)
+export async function deleteListEverywhere(listId) {
+  const { error } = await supabase
+    .from('shopping_lists')
+    .delete()
+    .eq('id', listId);
+  if (error) throw error;
+}
+
 
