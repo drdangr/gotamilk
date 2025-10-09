@@ -438,8 +438,11 @@ function App() {
         table: 'list_items'
       }, (payload) => {
         const { eventType, new: newRow, old } = payload;
-        const affectedListId = (newRow?.list_id ?? old?.list_id);
-        if (!affectedListId || affectedListId !== currentList.id) return;
+        // Для INSERT/UPDATE фильтруем по list_id. Для DELETE в old может не быть list_id
+        if (eventType !== 'DELETE') {
+          const affectedListId = newRow?.list_id;
+          if (!affectedListId || affectedListId !== currentList.id) return;
+        }
         setItems(prev => {
           if (eventType === 'INSERT') {
             if (prev.some(i => i.id === newRow.id)) return prev;
@@ -452,6 +455,8 @@ function App() {
             return prev.map(i => i.id === newRow.id ? { ...i, ...newRow } : i);
           }
           if (eventType === 'DELETE') {
+            // удаляем по первичному ключу (old содержит PK даже без replica identity full)
+            if (!old?.id) return prev;
             return prev.filter(i => i.id !== old.id);
           }
           return prev;
