@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { supabase } from './lib/supabaseClient';
-import { Plus, Settings, ChevronDown, ChevronUp, Check, X, Trash2, RotateCcw, ArrowLeft, Move, LogOut } from 'lucide-react';
+import { Plus, Settings, ChevronDown, ChevronUp, Check, X, Trash2, RotateCcw, ArrowLeft, Move, LogOut, Pencil } from 'lucide-react';
 import { upsertIntention, clearIntention } from './services/intentions';
 import { fetchBestPricesForItemNames, upsertItemPriceByCatalogId, fetchPricesForCatalogItem, deletePriceByCatalogId } from './services/prices';
 import { fetchCatalog, addCatalogItem, renameCatalogItem, deleteCatalogItem, upsertCatalogNames, fetchAliases, addAlias, deleteAlias, updateCatalogUnit, updateCatalogDisplayName, searchCatalogSuggestions, mapDisplayNamesForItems } from './services/catalog';
@@ -1576,9 +1576,13 @@ function App() {
                     <span className="font-medium truncate" title={item.short_name}>{item.short_name}</span>
                     <span className="text-xs text-gray-500">{item.unit || '—'}</span>
                   </div>
-                  <div className="flex gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
-                    <button onClick={() => renameCatalog(item)} className="text-blue-600 hover:underline text-sm">Переименовать</button>
-                    <button onClick={() => deleteCatalogEntry(item)} className="text-red-600 hover:underline text-sm">Удалить</button>
+                  <div className="flex gap-2">
+                    <button onClick={() => renameCatalog(item)} className="p-1.5 rounded hover:bg-blue-50 text-blue-600" title="Переименовать">
+                      <Pencil size={16} />
+                    </button>
+                    <button onClick={() => deleteCatalogEntry(item)} className="p-1.5 rounded hover:bg-red-50 text-red-600" title="Удалить">
+                      <Trash2 size={16} />
+                    </button>
                   </div>
                 </summary>
 
