@@ -1576,7 +1576,7 @@ function App() {
                     <span className="font-medium truncate" title={item.short_name}>{item.short_name}</span>
                     <span className="text-xs text-gray-500">{item.unit || '—'}</span>
                   </div>
-                  <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="flex gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                     <button onClick={() => renameCatalog(item)} className="text-blue-600 hover:underline text-sm">Переименовать</button>
                     <button onClick={() => deleteCatalogEntry(item)} className="text-red-600 hover:underline text-sm">Удалить</button>
                   </div>
