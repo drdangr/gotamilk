@@ -1626,7 +1626,7 @@ function App() {
         <div className="max-w-md mx-auto p-4">
           <div className="flex items-center justify-between mb-3">
             <button 
-              onClick={() => setCurrentView('lists')} 
+              onClick={() => { setCurrentView('stores'); setCurrentList(null); }} 
               className="text-blue-500 hover:text-blue-600 font-medium"
             >
               ← Назад
