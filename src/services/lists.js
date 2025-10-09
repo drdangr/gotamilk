@@ -98,10 +98,8 @@ export async function reassignOwner(listId, newOwnerUserId) {
 
 // Удаляет список для всех (только владелец)
 export async function deleteListEverywhere(listId) {
-  const { error } = await supabase
-    .from('shopping_lists')
-    .delete()
-    .eq('id', listId);
+  // Используем RPC, чтобы обойти защитный триггер "last member" при каскадном удалении
+  const { error } = await supabase.rpc('owner_delete_list', { p_list_id: listId });
   if (error) throw error;
 }
 

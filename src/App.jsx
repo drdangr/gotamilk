@@ -1127,26 +1127,26 @@ function App() {
           )}
           <div className="space-y-3">
             {myLists.map(list => (
-              <div key={list.id} className="p-4 bg-white rounded-lg shadow">
-                <div className="flex items-center justify-between gap-3">
-                  <button
-                    onClick={() => {
-                      setCurrentList(list);
-                      setCurrentView('shopping');
-                    }}
-                    className="text-left flex-1"
-                  >
-                    <div className="font-semibold text-lg">{list.name}</div>
-                  </button>
-                  <button
-                    onClick={() => openDeleteModal(list)}
-                    className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg text-red-600 hover:bg-red-50"
-                    title="Удалить / выйти"
-                    aria-label="Удалить список"
-                  >
-                    <X size={20} />
-                  </button>
-                </div>
+              <div key={list.id} className="p-4 bg-white rounded-lg shadow relative">
+                <button
+                  onClick={() => {
+                    setCurrentList(list);
+                    setCurrentView('shopping');
+                  }}
+                  className="text-left w-full pr-12"
+                >
+                  <div className="font-semibold text-lg">{list.name}</div>
+                </button>
+                <button
+                  type="button"
+                  onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); openDeleteModal(list); }}
+                  className="absolute top-3 right-3 w-10 h-10 flex items-center justify-center rounded-lg text-red-600 hover:bg-red-50 z-20"
+                  title="Удалить / выйти"
+                  aria-label="Удалить список"
+                >
+                  <X size={20} />
+                </button>
                 {/* Чипы участников */}
                 <div className="mt-2 flex flex-wrap gap-2">
                   {(listMembersMap[list.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
@@ -1173,26 +1173,26 @@ function App() {
               <div className="mt-6 mb-2 text-sm text-gray-500">Со мной поделились</div>
               <div className="space-y-3">
                 {sharedLists.map(list => (
-                  <div key={list.id} className="p-4 bg-white rounded-lg shadow">
-                    <div className="flex items-center justify-between gap-3">
-                      <button
-                        onClick={() => {
-                          setCurrentList(list);
-                          setCurrentView('shopping');
-                        }}
-                        className="text-left flex-1"
-                      >
-                        <div className="font-semibold text-lg">{list.name}</div>
-                      </button>
-                      <button
-                        onClick={() => openDeleteModal(list)}
-                        className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg text-red-600 hover:bg-red-50"
-                        title="Удалить / выйти"
-                        aria-label="Удалить список"
-                      >
-                        <X size={20} />
-                      </button>
-                    </div>
+                  <div key={list.id} className="p-4 bg-white rounded-lg shadow relative">
+                    <button
+                      onClick={() => {
+                        setCurrentList(list);
+                        setCurrentView('shopping');
+                      }}
+                      className="text-left w-full pr-12"
+                    >
+                      <div className="font-semibold text-lg">{list.name}</div>
+                    </button>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); openDeleteModal(list); }}
+                      className="absolute top-3 right-3 w-10 h-10 flex items-center justify-center rounded-lg text-red-600 hover:bg-red-50 z-20"
+                      title="Удалить / выйти"
+                      aria-label="Удалить список"
+                    >
+                      <X size={20} />
+                    </button>
                     <div className="mt-2 flex flex-wrap gap-2">
                       {(listMembersMap[list.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
                         <span key={m.user_id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">
@@ -1342,6 +1342,50 @@ function App() {
                 </button>
               )}
               <p className="text-xs text-gray-500 mt-3">Передайте код другу — он введет его в разделе «Присоединиться по коду».</p>
+            </div>
+          </div>
+        )}
+
+        {showDeleteModal && deleteTargetList && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end sm:items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full max-w-md p-6">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold">Удаление списка</h2>
+                <button onClick={() => setShowDeleteModal(false)} className="p-1"><X size={24} /></button>
+              </div>
+
+              {deleteTargetList.owner_id === currentUserId ? (
+                <div className="space-y-3 text-sm">
+                  {((listMembersMap[deleteTargetList.id] || []).filter(m => m.user_id !== currentUserId).length === 0) ? (
+                    <>
+                      <p>Список не расшарен. Удалить навсегда?</p>
+                      <button onClick={confirmDeleteAction} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Удалить навсегда</button>
+                    </>
+                  ) : (
+                    <>
+                      <p>Список расшарен. Выберите действие:</p>
+                      <div className="space-y-2">
+                        <label className="block">Назначить владельца:</label>
+                        <select value={newOwnerId} onChange={e => setNewOwnerId(e.target.value)} className="w-full p-2 border rounded">
+                          <option value="">— Выберите пользователя —</option>
+                          {(listMembersMap[deleteTargetList.id] || []).filter(m => m.user_id !== currentUserId).map(m => (
+                            <option key={m.user_id} value={m.user_id}>{m.nickname || m.user_id}</option>
+                          ))}
+                        </select>
+                        <button onClick={confirmDeleteAction} disabled={!newOwnerId} className="w-full p-3 bg-blue-500 text-white rounded-lg disabled:bg-gray-300">Назначить владельца</button>
+                      </div>
+                      <div className="pt-2">
+                        <button onClick={() => { setNewOwnerId(''); confirmDeleteAction(); }} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Удалить у всех</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-3 text-sm">
+                  <p>Выйти из участников и удалить список у себя?</p>
+                  <button onClick={confirmDeleteAction} className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600">Выйти и удалить у меня</button>
+                </div>
+              )}
             </div>
           </div>
         )}
