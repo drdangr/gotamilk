@@ -43,6 +43,62 @@ function App() {
   const [typeaheadOpen, setTypeaheadOpen] = useState(false);
   const [typeaheadItems, setTypeaheadItems] = useState([]);
   const typeaheadTimer = useRef(null);
+
+  // Helpers: нормализация, парсинг количества, подсветка
+  const normalizeText = (s) => (s || '').toLowerCase().trim();
+
+  const parseNameAndQuantity = (raw) => {
+    const input = (raw || '').trim();
+    if (!input) return { baseName: '', qtyText: '', qtyNum: undefined };
+    // pattern: name x2
+    let m = input.match(/^(.*?)(?:\s*[x×]\s*)(\d+(?:[.,]\d+)?)[\s]*$/i);
+    if (m) {
+      const num = parseFloat(m[2].replace(',', '.'));
+      return { baseName: m[1].trim(), qtyText: String(num), qtyNum: isNaN(num) ? undefined : num };
+    }
+    // pattern: name 2кг|2 кг|2л|2 л|2шт
+    m = input.match(/^(.*?)(\d+(?:[.,]\d+)?)[\s]*(кг|г|л|мл|шт)[\s]*$/i);
+    if (m) {
+      const num = parseFloat(m[2].replace(',', '.'));
+      const unit = m[3];
+      return { baseName: m[1].trim(), qtyText: `${m[2]} ${unit}`.trim(), qtyNum: isNaN(num) ? undefined : num, unit };
+    }
+    // pattern: trailing number
+    m = input.match(/^(.*?)(\d+(?:[.,]\d+)?)[\s]*$/);
+    if (m) {
+      const num = parseFloat(m[2].replace(',', '.'));
+      return { baseName: m[1].trim(), qtyText: String(num), qtyNum: isNaN(num) ? undefined : num };
+    }
+    return { baseName: input, qtyText: '', qtyNum: undefined };
+  };
+
+  const highlight = (text, term) => {
+    const t = text || '';
+    const q = (term || '').trim();
+    if (!q) return t;
+    const i = t.toLowerCase().indexOf(q.toLowerCase());
+    if (i === -1) return t;
+    return (
+      <>
+        {t.slice(0, i)}
+        <span className="bg-yellow-100">{t.slice(i, i + q.length)}</span>
+        {t.slice(i + q.length)}
+      </>
+    );
+  };
+
+  const getExistingCount = (name) => {
+    const nm = normalizeText(name);
+    const matched = items.filter(i => normalizeText(i.name) === nm);
+    if (matched.length === 0) return 0;
+    let sum = 0;
+    let allNumeric = true;
+    matched.forEach(i => {
+      const n = parseFloat((i.quantity || '').toString().replace(',', '.'));
+      if (isNaN(n)) allNumeric = false; else sum += n;
+    });
+    return allNumeric ? (sum || matched.length) : matched.length;
+  };
   const [claudeApiKey, setClaudeApiKey] = useState('');
   const [expandedDepts, setExpandedDepts] = useState({});
   const [showSettings, setShowSettings] = useState(false);
@@ -513,7 +569,8 @@ function App() {
   };
 
   const addItem = async (overrideName) => {
-    const nameToAdd = (overrideName ?? newItemName).trim();
+    const { baseName, qtyText } = parseNameAndQuantity(overrideName ?? newItemName);
+    const nameToAdd = baseName.trim();
     if (!nameToAdd || !currentList) return;
 
     // Если товар уже есть в списке — увеличиваем количество на 1 (или ставим 1, если пусто)
@@ -538,15 +595,38 @@ function App() {
 
     const department = await categorizeItem(nameToAdd);
     try {
-      await addItemMutation.mutateAsync({ name: nameToAdd, quantity: newItemQuantity, department });
+      await addItemMutation.mutateAsync({ name: nameToAdd, quantity: qtyText || newItemQuantity, department });
       try { await upsertCatalogNames([nameToAdd]); } catch {}
     } catch (e) {
-      await enqueueOp({ entity: 'item', type: 'add', listId: currentList.id, name: nameToAdd, quantity: newItemQuantity, department, op_id: crypto.randomUUID?.() || `${Date.now()}` });
+      await enqueueOp({ entity: 'item', type: 'add', listId: currentList.id, name: nameToAdd, quantity: qtyText || newItemQuantity, department, op_id: crypto.randomUUID?.() || `${Date.now()}` });
       setPendingOps(await countPending());
       addToast('Офлайн: товар добавлен в очередь');
     }
     setNewItemName('');
     setNewItemQuantity('');
+  };
+
+  const parseQtyNumber = (q) => {
+    const num = parseFloat((q || '').toString().replace(',', '.'));
+    return Number.isFinite(num) ? num : NaN;
+  };
+
+  const updateItemQuantity = async (itemId, nextQtyText) => {
+    try {
+      await supabase.from('list_items').update({ quantity: nextQtyText }).eq('id', itemId);
+      setItems(prev => prev.map(it => it.id === itemId ? { ...it, quantity: nextQtyText } : it));
+    } catch (e) {
+      await enqueueOp({ entity: 'item', type: 'update_qty', id: itemId, quantity: nextQtyText, op_id: crypto.randomUUID?.() || `${Date.now()}` });
+      setPendingOps(await countPending());
+      addToast('Офлайн: обновлено количество');
+    }
+  };
+
+  const adjustQty = async (item, delta) => {
+    const current = parseQtyNumber(item.quantity);
+    let next = Number.isNaN(current) ? (delta > 0 ? 1 : 1) : current + delta;
+    if (next < 1) next = 1;
+    await updateItemQuantity(item.id, String(next));
   };
 
   const claimItem = async (itemId) => {
@@ -857,11 +937,11 @@ function App() {
     );
   }
 
-  const normalize = (s) => (s || '').toLowerCase().trim();
+  // удалён старый normalize (замещён normalizeText)
 
   // Фильтр по "моему" магазину
   const filteredItems = filterMyStore && myStoreId
-    ? items.filter(it => bestPrices[normalize(it.name)]?.store_id === myStoreId)
+    ? items.filter(it => bestPrices[normalizeText(it.name)]?.store_id === myStoreId)
     : items;
 
   // (удалено дублирование хука)
@@ -1332,10 +1412,15 @@ function App() {
                     className="w-full text-left px-3 py-3 hover:bg-gray-100 rounded-lg flex items-center justify-between"
                   >
                     <div className="min-w-0">
-                      <div className="font-medium truncate">{s.short_name}</div>
-                      {s.display_name && <div className="text-xs text-gray-500 truncate">{s.display_name}</div>}
+                      <div className="font-medium truncate">{highlight(s.short_name, newItemName)}</div>
+                      {s.display_name && <div className="text-xs text-gray-500 truncate">{highlight(s.display_name, newItemName)}</div>}
                     </div>
-                    {s.unit && <span className="text-xs text-gray-500 ml-3">{s.unit}</span>}
+                    <div className="flex items-center gap-2 ml-3">
+                      {s.unit && <span className="text-xs text-gray-500">{s.unit}</span>}
+                      {getExistingCount(s.short_name) > 0 && (
+                        <span className="text-xs px-2 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200">в списке ×{getExistingCount(s.short_name)}</span>
+                      )}
+                    </div>
                   </button>
                 ))}
                 <button
@@ -1476,12 +1561,30 @@ function App() {
                         )
                       )}
 
+                      {/* +/- количество */}
+                      <div className="flex-shrink-0 flex items-center gap-1">
+                        <button
+                          onClick={() => adjustQty(item, -1)}
+                          className="p-1 w-7 h-7 flex items-center justify-center rounded border text-gray-700 hover:bg-gray-50"
+                          title="-1"
+                        >
+                          −
+                        </button>
+                        <button
+                          onClick={() => adjustQty(item, +1)}
+                          className="p-1 w-7 h-7 flex items-center justify-center rounded border text-gray-700 hover:bg-gray-50"
+                          title="+1"
+                        >
+                          +
+                        </button>
+                      </div>
+
                       <button
                         onClick={() => {
                           setMovingItem({ itemId: item.id, itemName: item.name, fromDept: deptName });
                           setShowDepartmentPicker(true);
                         }}
-                        className="flex-shrink-0 p-2 text-blue-500 hover:bg-blue-50 rounded transition-colors"
+                        className="flex-shrink-0 p-1.5 text-blue-500 hover:bg-blue-50 rounded transition-colors"
                         title="Переместить"
                       >
                         <Move size={18} />
@@ -1489,7 +1592,7 @@ function App() {
 
                       <button
                         onClick={() => deleteItem(item.id)}
-                        className="flex-shrink-0 p-2 text-red-500 hover:bg-red-50 rounded transition-colors"
+                        className="flex-shrink-0 p-1.5 text-red-500 hover:bg-red-50 rounded transition-colors"
                         title="Удалить"
                       >
                         <Trash2 size={18} />
